@@ -1,0 +1,103 @@
+---
+- hosts: master[0]
+  become: true
+  tasks:
+
+  #TODO copy same public key everywhere
+#--node-ip={{ hostvars[inventory_hostname]['ansible_enp0s8']['ipv4']['address'] }}
+  - name: check if kubeadmin init has already been run
+    shell: kubectl cluster-info
+    become: false
+    ignore_errors: yes
+    register: cluster_info
+
+  - debug:
+      msg: "kubectl cluster-info return code: {{ cluster_info.rc }}"
+
+  - name: Installing master
+    block:
+      - name: Kubeadm init
+        shell: kubeadm init --apiserver-advertise-address={{ hostvars['master-1']['ansible_enp0s8']['ipv4']['address'] }} --pod-network-cidr=10.244.0.0/16
+
+      - name: create .kube dir in vagrant user home
+        file:
+          path: /home/vagrant/.kube
+          owner: vagrant
+          group: docker
+          state: 'directory'
+
+      - name: copy kubernetes admin credentials to user
+        copy:
+          remote_src: yes
+          src: /etc/kubernetes/admin.conf
+          dest: /home/vagrant/.kube/config
+          owner: vagrant
+          group: docker
+
+      - name: Configure pod networking with flannel
+        copy:
+          src: kube-flannel.yml
+          dest: /home/vagrant/kube-flannel.yml
+          mode: '0644'
+          owner: vagrant
+          group: docker
+
+    when: cluster_info.rc == 1
+
+  - name: Deploy flannel
+    become: false
+    shell: kubectl apply -f /home/vagrant/kube-flannel.yml
+
+  - name: Deploy dashboard
+    become: false
+    shell: kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.0.0-beta4/aio/deploy/recommended.yaml
+
+
+  - name: "Cluster token"
+    shell: kubeadm token list | cut -d ' ' -f1 | sed -n '2p'
+    register: K8S_TOKEN
+    run_once: True
+
+  - debug:
+      msg: "K8S_TOKEN: {{ K8S_TOKEN.stdout }}"
+
+  - name: "CA Hash"
+    shell: openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed 's/^.* //'
+    register: K8S_MASTER_CA_HASH
+    run_once: True
+
+  - debug:
+      msg: "K8S_MASTER_CA_HASH: {{ K8S_MASTER_CA_HASH.stdout }}"
+# One way of sharing registered vars between plays
+# https://stackoverflow.com/questions/33896847/how-do-i-set-register-a-variable-to-persist-between-plays-in-ansible
+  - name: "Add K8S Token and Hash to dummy host"
+    add_host:
+      name:   "K8S_TOKEN_HOLDER"
+      token:  "{{ K8S_TOKEN.stdout }}"
+      hash:   "{{ K8S_MASTER_CA_HASH.stdout }}"
+
+
+## Configure the nodes with the vars from master
+- hosts: node
+  become: true
+  tasks:
+  - name:
+    debug:
+      msg: "[Master] K8S_TOKEN_HOLDER K8S token is {{ hostvars['K8S_TOKEN_HOLDER']['token'] }}"
+
+  - name:
+    debug:
+      msg: "[Master] K8S_TOKEN_HOLDER K8S Hash is  {{ hostvars['K8S_TOKEN_HOLDER']['hash'] }}"
+
+  - name: check if kubeadmin join has already been run
+    stat:
+      path: /etc/kubernetes/kubelet.conf
+    register: node_joined
+
+  - debug:
+      msg: "Does kubelet.conf already exist? {{ node_joined.stat.exists }}"
+
+
+  - name: join the cluster
+    shell: kubeadm join  {{ hostvars['master-1']['ansible_enp0s8']['ipv4']['address'] }}:6443 --token  {{ hostvars['K8S_TOKEN_HOLDER']['token'] }} --discovery-token-ca-cert-hash sha256:{{ hostvars['K8S_TOKEN_HOLDER']['hash'] }}
+    when: not node_joined.stat.exists
